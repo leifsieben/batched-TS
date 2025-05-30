@@ -1,5 +1,5 @@
 from typing import List, Optional
-
+from collections import defaultdict
 from reagent import Reagent
 
 
@@ -34,3 +34,16 @@ def read_reagents(reagent_file_list, num_to_select: Optional[int]) -> List[Reage
         reagent_list = create_reagents(filename=reagent_filename, num_to_select=num_to_select)
         reagents.append(reagent_list)
     return reagents
+
+
+
+def build_reaction_map(all_reagents: list[Reagent]) -> dict[str, dict[int, list[Reagent]]]:
+    """
+    Builds a fast lookup table to find all Reagents for a given reaction ID. 
+    :param all_reagents: a list of Reagents.
+    :return: Map of reaction ID to Reagents. 
+    """
+    reaction_map: dict[str, dict[int, list[Reagent]]] = defaultdict(lambda: defaultdict(list))
+    for r in all_reagents:
+        reaction_map[r.reaction_id][r.synton_idx].append(r)
+    return reaction_map

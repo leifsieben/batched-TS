@@ -6,6 +6,8 @@ class Reagent:
     __slots__ = [
         "reagent_name",
         "smiles",
+        "reaction_id", 
+        "synton_idx",
         "min_uncertainty",
         "initial_scores",
         "mol",
@@ -15,20 +17,22 @@ class Reagent:
         "current_phase"
     ]
 
-    def __init__(self, reagent_name: str, smiles: str):
+    def __init__(self, reagent_name: str, smiles: str, reaction_id: str, synton_idx: int):
         """
         Basic init
         :param reagent_name: Reagent name
         :param smiles: smiles string
         """
-        self.smiles = smiles
         self.reagent_name = reagent_name
+        self.smiles = smiles
+        self.reaction_id = reaction_id, 
+        self.synton_idx = synton_idx,
         self.mol = Chem.MolFromSmiles(self.smiles)
         self.initial_scores = []
         self.known_var = None  # Will be initialized during init_given_prior
         self.current_phase = "warmup"
-        self.current_mean = 0
-        self.current_std = 0
+        self.current_mean = 0.0
+        self.current_std = 0.0
 
     def add_score(self, score: float):
         """
