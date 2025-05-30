@@ -25,8 +25,8 @@ class Reagent:
         """
         self.reagent_name = reagent_name
         self.smiles = smiles
-        self.reaction_id = reaction_id, 
-        self.synton_idx = synton_idx,
+        self.reaction_id = reaction_id 
+        self.synton_idx = synton_idx
         self.mol = Chem.MolFromSmiles(self.smiles)
         self.initial_scores = []
         self.known_var = None  # Will be initialized during init_given_prior

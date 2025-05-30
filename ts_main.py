@@ -5,12 +5,14 @@ import json
 import sys
 from datetime import timedelta
 from timeit import default_timer as timer
-
+from evaluators import Evaluator
 import pandas as pd
-
+import math
+import numpy as np
 from thompson_sampling import ThompsonSampler
 from ts_logger import get_logger
-
+from ts_utils import create_reagents, build_reaction_map
+from disallow_tracker import DisallowTracker
 
 def read_input(json_filename: str) -> dict:
     """
@@ -49,38 +51,92 @@ def run_ts(input_dict: dict, hide_progress: bool = False) -> None:
     :param hide_progress: hide the progress bar
     :param input_dict: dictionary with input parameters
     """
-    evaluator = input_dict["evaluator_class"]
-    reaction_smarts = input_dict["reaction_smarts"]
-    num_ts_iterations = input_dict["num_ts_iterations"]
-    reagent_file_list = input_dict["reagent_file_list"]
-    num_warmup_trials = input_dict["num_warmup_trials"]
-    result_filename = input_dict.get("results_filename")
-    ts_mode = input_dict["ts_mode"]
-    log_filename = input_dict.get("log_filename")
+    # 1) Grab whatever was passed in:
+    maybe_eval = input_dict["evaluator_class"]
+    # If it's already an Evaluator instance, use it. Otherwise, treat it as a class.
+    if isinstance(maybe_eval, Evaluator):
+        evaluator = maybe_eval
+    else:
+        # assume it's a class you need to instantiate
+        EvaluatorCls = maybe_eval
+        evaluator    = EvaluatorCls(input_dict["evaluator_arg"])
+
+    # 2) Grab reaction SMARTS from your reaction_file TSV
+    df = pd.read_csv(input_dict["reaction_file"], sep="\t")
+    reaction_smarts = df.loc[0, "Reaction"]
+    reaction_id     = df.loc[0, "reaction_id"] 
+
+    # 3) Pull other params
+    num_ts_iterations  = input_dict["num_ts_iterations"]
+    reagent_file  = input_dict["reagent_file"]
+    num_warmup_trials  = input_dict["num_warmup_trials"]
+    result_filename    = input_dict.get("results_filename")
+    ts_mode            = input_dict["ts_mode"]
+    log_filename       = input_dict.get("log_filename")
+
+    # 4) Set up logger & sampler
     logger = get_logger(__name__, filename=log_filename)
-    ts = ThompsonSampler(mode=ts_mode)
+    ts     = ThompsonSampler(mode=ts_mode)
     ts.set_hide_progress(hide_progress)
     ts.set_evaluator(evaluator)
-    ts.read_reagents(reagent_file_list=reagent_file_list, num_to_select=None)
+
+    # 5) Load *all* synthons, filter to just this reaction, then group into slots
+    from collections import defaultdict
+    all_regs = []
+    for fn in reagent_file if isinstance(reagent_file, (list,tuple)) else [reagent_file]:
+        all_regs.extend(create_reagents(fn))
+
+    # keep only those with matching reaction_id
+    regs = [r for r in all_regs if r.reaction_id == reaction_id]
+    if not regs:
+        raise RuntimeError(f"No reagents found for reaction_id={reaction_id}")
+
+    # group by synton_idx into slot-lists
+    groups = defaultdict(list)
+    for r in regs:
+        groups[r.synton_idx].append(r)
+    reagent_lists = [groups[i] for i in sorted(groups)]
+
+    # hand the grouped slots to the sampler
+    ts.reagent_lists   = reagent_lists
+    ts.num_prods       = math.prod(len(x) for x in reagent_lists)
+    ts._disallow_tracker = DisallowTracker([len(x) for x in reagent_lists])
+
+    # rebuild the caches exactly as in read_reagents()
+    ts.all_reagents = [r for slot in reagent_lists for r in slot]
+    ts.reaction_map = build_reaction_map(ts.all_reagents)
+    ts.n_sites      = len(reagent_lists)
+    ts._means       = np.zeros(len(ts.all_reagents), dtype=float)
+    ts._stds        = np.zeros(len(ts.all_reagents), dtype=float)
+    ts._refresh_global_stats()
+
     ts.set_reaction(reaction_smarts)
-    # run the warm-up phase to generate an initial set of scores for each reagent
+
+    # 6) Warm-up & search
     ts.warm_up(num_warmup_trials=num_warmup_trials)
-    # run the search with TS
     out_list = ts.search(num_cycles=num_ts_iterations)
-    total_evaluations = evaluator.counter
-    percent_searched = total_evaluations / ts.get_num_prods() * 100
-    logger.info(f"{total_evaluations} evaluations | {percent_searched:.3f}% of total")
-    # write the results to disk
+
+    # 7) Logging & save
+    total_evals      = evaluator.counter
+    percent_searched = total_evals / ts.get_num_prods() * 100
+    logger.info(f"{total_evals} evaluations | {percent_searched:.3f}% of total")
+
+    # write results
     out_df = pd.DataFrame(out_list, columns=["score", "SMILES", "Name"])
-    if result_filename is not None:
+    if result_filename:
         out_df.to_csv(result_filename, index=False)
         logger.info(f"Saved results to: {result_filename}")
+
+    # print top hits
     if not hide_progress:
-        if ts_mode == "maximize":
-            print(out_df.sort_values("score", ascending=False).drop_duplicates(subset="SMILES").head(10))
-        else:
-            print(out_df.sort_values("score", ascending=True).drop_duplicates(subset="SMILES").head(10))
-    return out_df
+        ascending = (ts_mode != "maximize")
+        top10 = (
+            out_df
+            .sort_values("score", ascending=ascending)
+            .drop_duplicates(subset="SMILES")
+            .head(10)
+        )
+        print(top10)
 
 
 def run_10_cycles():
