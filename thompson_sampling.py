@@ -11,7 +11,7 @@ from tqdm.auto import tqdm
 from disallow_tracker import DisallowTracker
 from reagent import Reagent
 from ts_logger import get_logger
-from ts_utils import read_reagents
+from ts_utils import read_reagents, build_reaction_map
 from evaluators import DBEvaluator
 
 
@@ -32,6 +32,7 @@ class ThompsonSampler:
         self._disallow_tracker = None
         self.hide_progress = False
         self._mode = mode
+        self.rng = np.random.default_rng()
         if self._mode == "maximize":
             self.pick_function = np.nanargmax
             self._top_func = max
@@ -49,6 +50,12 @@ class ThompsonSampler:
         else:
             raise ValueError(f"{mode} is not a supported argument")
         self._warmup_std = None
+
+    def _refresh_global_stats(self):
+        """Copy each reagent’s current_mean/std into our flat arrays."""
+        for i, r in enumerate(self.all_reagents):
+            self._means[i] = r.current_mean
+            self._stds[i]  = r.current_std
 
     def _boltzmann_reweighted_pick(self, scores: np.ndarray):
         """Rather than choosing the top sampled score, use a reweighted probability.
@@ -86,6 +93,42 @@ class ThompsonSampler:
         self.num_prods = math.prod([len(x) for x in self.reagent_lists])
         self.logger.info(f"{self.num_prods:.2e} possible products")
         self._disallow_tracker = DisallowTracker([len(x) for x in self.reagent_lists])
+        # now that reagents are loaded, build flattened indices & caches
+        self.all_reagents = [r for slot in self.reagent_lists for r in slot]
+        self.reaction_map = build_reaction_map(self.all_reagents)
+        self.n_sites = max(r.synton_idx for r in self.all_reagents) + 1
+        self._means = np.zeros(len(self.all_reagents), dtype=float)
+        self._stds  = np.zeros(len(self.all_reagents), dtype=float)
+        self._refresh_global_stats()
+ 
+    def evaluate_batch(self, choices: List[List[int]]) -> List[Tuple[str,str,float]]:
+        """
+        Batch‐evaluate many reagent combinations in one go.
+        Gaussian updates commute, so calling add_score per appearance
+        yields the same posterior as a single aggregated update.
+        """
+        results = []
+        # if evaluator supports batch, use it
+        has_batch = hasattr(self.evaluator, "evaluate_batch")
+        for choice_list in choices:
+            # build product & name
+            reagents = [self.reagent_lists[i][c] for i,c in enumerate(choice_list)]
+            prod = self.reaction.RunReactants([r.mol for r in reagents])[0][0]
+            Chem.SanitizeMol(prod)
+            smiles = Chem.MolToSmiles(prod)
+            name = "_".join(r.reagent_name for r in reagents)
+            # score
+            if has_batch:
+                score = self.evaluator.evaluate_batch([prod])[0]
+            else:
+                score = self.evaluator.evaluate(prod)
+            # update priors
+            if np.isfinite(score):
+                for r in reagents:
+                    r.add_score(float(score))
+            results.append((smiles, name, float(score)))
+        return results
+
 
     def get_num_prods(self) -> int:
         """
@@ -194,6 +237,7 @@ class ThompsonSampler:
                     self.logger.info(f"Skipping reagent {reagent.reagent_name} because there were no successful evaluations during warmup")
                     self._disallow_tracker.retire_one_synthon(i, j)
         self.logger.info(f"Top score found during warmup: {max(warmup_scores):.3f}")
+        self._refresh_global_stats()
         return warmup_results
 
     def search(self, num_cycles=25):
@@ -224,3 +268,82 @@ class ThompsonSampler:
                 top_score, top_smiles, top_name = self._top_func(out_list)
                 self.logger.info(f"Iteration: {i} max score: {top_score:2f} smiles: {top_smiles} {top_name}")
         return out_list
+
+
+# Additional methods for batched sampling
+
+    def _propose_molecule(self) -> List[Reagent]:
+        """
+        Draws one full combination of synthons (first unconstrained,
+        then reaction-constrained), updates disallow tracker, but
+        does *not* call evaluator or update priors.
+        """
+        # Helper to sample and pick an index via current pick_function
+        def _draw_pick(means, stds, mask=None):
+            samples = self.rng.normal(means, stds)
+            if mask is not None and mask.size:
+                samples[mask] = np.nan
+            idx = self.pick_function(samples)
+            if np.isnan(idx):            # everything masked → no pick
+                return None
+            return int(idx)
+
+        # 1) Unconstrained first pick over entire reagent pool (vectorized)
+        samples = self.rng.normal(self._means, self._stds)
+        idx0    = self.pick_function(samples)
+        r0 = self.all_reagents[idx0]
+
+        combo = {r0.synton_idx: r0}
+        # mark this pick in tracker and retire if exhausted
+        partial = [DisallowTracker.Empty] * self.n_sites
+        partial[r0.synton_idx] = idx0
+        self._disallow_tracker.update(partial)
+        self._disallow_tracker.retire_one_synthon(r0.synton_idx, idx0)
+
+        # 2) Fill remaining slots for this reaction
+        for pos, slot_list in self.reaction_map[r0.reaction_id].items():
+            if pos == r0.synton_idx:
+                continue
+            # build means and stds for this slot
+            mus = np.array([r.current_mean for r in slot_list])
+            sigs = np.array([r.current_std  for r in slot_list])
+            # build partial mask for disallowed indices
+            partial = [DisallowTracker.Empty] * self.n_sites
+            for p, r_obj in combo.items():
+                idx_in_slot = slot_list.index(r_obj)
+                partial[p] = idx_in_slot
+            partial[pos] = DisallowTracker.To_Fill
+            mask = self._disallow_tracker.get_disallowed_selection_mask(partial)
+            # pick using same logic, applying mask
+            idx = _draw_pick(mus, sigs, mask)
+
+            chosen = slot_list[idx]
+            combo[pos] = chosen
+            partial[pos] = idx
+            self._disallow_tracker.update(partial)
+            self._disallow_tracker.retire_one_synthon(pos, idx)
+
+        # return reagents in slot order
+        return [combo[i] for i in sorted(combo)]
+    
+    def enumerate_molecule(self) -> str:
+        """
+        Propose one molecule and return its SMILES; tracker is updated
+        exactly as before.
+        """
+        reagents = self._propose_molecule()
+        prod = self.reaction.RunReactants([r.mol for r in reagents])[0][0]
+        smiles = Chem.MolToSmiles(prod)
+        # note: retirement of fully-exhausted reagents is still handled by
+        # self._disallow_tracker inside _propose_molecule()
+        return smiles
+
+    def sample_batch(self, batch_size: int) -> List[str]:
+        batch, attempts = [], 0
+        while len(batch) < batch_size and attempts < batch_size*10:
+            mol = self._propose_molecule()
+            attempts += 1
+            if mol:
+                smiles = Chem.MolToSmiles(self.reaction.RunReactants([r.mol for r in mol])[0][0])
+                batch.append(smiles)
+        return batch
