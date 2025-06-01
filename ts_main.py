@@ -77,6 +77,14 @@ def run_ts(input_dict: dict, hide_progress: bool = False) -> None:
 
     # 4) Set up logger & sampler
     logger = get_logger(__name__, filename=log_filename)
+    if results_filename and os.path.exists(results_filename):
+        logger.warning(f"Output CSV file '{results_filename}' already exists. Overwriting previous results.")
+        try:
+            os.remove(results_filename)
+            logger.info(f"Successfully removed existing file: {results_filename}")
+        except Exception as e:
+            logger.error(f"Failed to remove existing file {results_filename}: {e}")
+            raise
     ts = ThompsonSampler(mode=ts_mode, log_filename=log_filename, output_csv=results_filename)
     ts.set_reactions(reaction_smarts_map)
     ts.set_hide_progress(hide_progress)

@@ -54,6 +54,7 @@ class DisallowTracker:
         return self._disallow_mask[tuple(current_selection)]
 
     def retire_one_synthon(self, cycle_id: int, synthon_index: int):
+        print("Retiring synthon", cycle_id, synthon_index, flush=True)
         retire_mask = [self.Empty] * self.n_cycles
         retire_mask[cycle_id] = synthon_index
         self._retire_synthon_mask(retire_mask=retire_mask)
@@ -178,3 +179,48 @@ class DisallowTracker:
 
                         self._update([self.Empty if v == self.To_Fill else v for v in selected])
             selected[idx] = value
+
+    def is_reagent_exhausted(self, slot_idx: int, reagent_idx: int) -> bool:
+        """
+        Check if a specific reagent at a specific slot is exhausted.
+        A reagent is exhausted if selecting it leads to no valid combinations.
+        """
+        # Create a selection pattern with this reagent fixed and all others Empty
+        test_selection = [DisallowTracker.Empty] * self.n_cycles
+        test_selection[slot_idx] = reagent_idx
+        
+        # Check all possible ways to fill the remaining slots
+        remaining_slots = [i for i in range(self.n_cycles) if i != slot_idx]
+        
+        # If this is a single-slot reaction, check if this reagent has been used
+        if not remaining_slots:
+            single_pattern = tuple(test_selection)
+            return reagent_idx in self._disallow_mask.get(single_pattern, set())
+        
+        # For multi-slot reactions, check if any valid combinations exist
+        def can_fill_slots(selection_so_far: list, slots_to_fill: list) -> bool:
+            if not slots_to_fill:
+                # All slots filled - check if this combination is allowed
+                return tuple(selection_so_far) not in self._disallow_mask or \
+                    len(self._disallow_mask[tuple(selection_so_far)]) == 0
+            
+            current_slot = slots_to_fill[0]
+            remaining_slots = slots_to_fill[1:]
+            
+            # Try each reagent at this slot
+            for candidate_reagent in range(self._initial_reagent_counts[current_slot]):
+                test_sel = selection_so_far.copy()
+                test_sel[current_slot] = DisallowTracker.To_Fill
+                
+                # Check if this candidate is disallowed
+                disallowed = self._disallow_mask.get(tuple(test_sel), set())
+                if candidate_reagent not in disallowed:
+                    # Try this reagent and recurse
+                    test_sel[current_slot] = candidate_reagent
+                    if can_fill_slots(test_sel, remaining_slots):
+                        return True
+            
+            return False
+        
+        # Check if any valid combination exists with this reagent
+        return not can_fill_slots(test_selection, remaining_slots)            

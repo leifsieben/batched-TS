@@ -390,189 +390,275 @@ class ThompsonSampler:
         self.logger.info(f"Warm-up completed. Initialized {initialized_count} reagents.")
         return warmup_results
 
+    def enumerate_molecule(self, rng: np.random.Generator, cycle: int = 0, attempt: int = 0) -> tuple:
+        """
+        Enumerate a single molecule using Thompson Sampling with proper exhaustion checking.
+        """
+        # Precompute flat list if not already done
+        if not hasattr(self, '_all_reagents_cache'):
+            self._all_reagents_cache = []
+            for rxn_id in self.rxn_ids:
+                per_slot = self._reagents_by_rxn[rxn_id]
+                for slot_i, slot_reagents in enumerate(per_slot):
+                    for reagent_idx, reagent in enumerate(slot_reagents):
+                        self._all_reagents_cache.append((rxn_id, slot_i, reagent_idx, reagent))
+        
+        all_reagents = self._all_reagents_cache
+        
+        # Step 1: Thompson sample from ALL reagents, but exclude exhausted ones
+        reagent_samples = []
+        active_reagents = 0
+        
+        for rxn_id, slot_i, reagent_idx, reagent in all_reagents:
+            # Check if this reagent is exhausted using DisallowTracker
+            tracker = self._trackers_by_rxn[rxn_id]
+            
+            if tracker.is_reagent_exhausted(slot_i, reagent_idx):
+                reagent_samples.append(np.nan)  # Exclude exhausted reagents
+                if cycle < 2 and attempt < 10:  # Debug logging
+                    self.logger.debug(f"Reagent {reagent.reagent_name} (rxn={rxn_id}, slot={slot_i}, idx={reagent_idx}) is exhausted")
+            else:
+                active_reagents += 1
+                if hasattr(reagent, 'current_mean') and hasattr(reagent, 'current_std'):
+                    sample = rng.normal(reagent.current_mean, reagent.current_std)
+                    reagent_samples.append(sample)
+                else:
+                    reagent_samples.append(0.0)  # Default for uninitialized
 
+        # Check if all reagents are exhausted
+        if active_reagents == 0:
+            return False, {
+                'error_type': 'all_reagents_exhausted',
+                'error_msg': f'All reagents have been exhausted. Total reagents: {len(all_reagents)}'
+            }
+
+        # Pick best reagent using self.pick_function
+        best_reagent_idx = int(self.pick_function(np.array(reagent_samples)))
+        chosen_rxn, init_slot, init_reagent_idx, chosen_reagent = all_reagents[best_reagent_idx]
+
+        # LOG: Track which reagents are being selected
+        if cycle < 5 and attempt < 100:
+            #self.logger.info(f"Batch {cycle+1}, Attempt {attempt}: Selected reagent {chosen_reagent.reagent_name} "
+            #                f"(rxn={chosen_rxn}, slot={init_slot}, idx={init_reagent_idx}) "
+            #                f"sample={reagent_samples[best_reagent_idx]:.4f}, active={active_reagents}/{len(all_reagents)}")
+
+        # Step 2: That reagent defines the reaction - get reaction info
+        per_slot_lists = self._reagents_by_rxn[chosen_rxn]
+        tracker = self._trackers_by_rxn[chosen_rxn]
+        n_slots = len(per_slot_lists)
+        
+        # Step 3: Initialize selection with the chosen initial reagent
+        local_sel = [DisallowTracker.Empty] * n_slots
+        local_sel[init_slot] = init_reagent_idx
+        
+        # Step 4: Fill remaining slots using Thompson Sampling
+        remaining_slots = [i for i in range(n_slots) if i != init_slot]
+        random.shuffle(remaining_slots)
+        
+        for slot_i in remaining_slots:
+            # Set current slot to To_Fill
+            local_sel[slot_i] = DisallowTracker.To_Fill
+            disallow_mask = tracker.get_disallowed_selection_mask(local_sel)
+            
+            slot_reagents = per_slot_lists[slot_i]
+            
+            # Get current beliefs for reagents in this slot
+            mus = np.array([
+                r.current_mean if hasattr(r, 'current_mean') else 0.0 
+                for r in slot_reagents
+            ])
+            sigs = np.array([
+                r.current_std if hasattr(r, 'current_std') else 1.0 
+                for r in slot_reagents
+            ])
+            
+            # Thompson sampling: sample from beliefs
+            choice_samples = rng.normal(size=len(slot_reagents)) * sigs + mus
+            
+            # Mask out disallowed reagents
+            if disallow_mask:
+                choice_samples[np.array(list(disallow_mask))] = np.nan
+            
+            # Check if any valid options remain
+            if np.all(np.isnan(choice_samples)):
+                return False, {
+                    'error_type': 'no_valid_partners',
+                    'error_msg': f'No valid partners for slot {slot_i} in reaction {chosen_rxn}. '
+                            f'Disallowed: {len(disallow_mask)}/{len(slot_reagents)} reagents'
+                }
+            
+            # Select reagent using pick_function
+            chosen_idx = int(self.pick_function(choice_samples))
+            local_sel[slot_i] = chosen_idx
+        
+        # Step 5: Update DisallowTracker
+        try:
+            tracker.update(local_sel)
+        except Exception as e:
+            return False, {
+                'error_type': 'disallow_tracker_failed',
+                'error_msg': f'DisallowTracker update failed: {e}'
+            }
+        
+        # Step 6: Generate the molecule
+        selected_reagents = [per_slot_lists[slot_i][local_sel[slot_i]] for slot_i in range(n_slots)]
+        rxn = self._rxn_by_id[chosen_rxn]
+        
+        try:
+            products = rxn.RunReactants([r.mol for r in selected_reagents])
+            
+            if not products:
+                return False, {
+                    'error_type': 'no_products',
+                    'error_msg': 'RDKit reaction returned no products'
+                }
+            
+            product_mol = products[0][0]
+            Chem.SanitizeMol(product_mol)
+            product_name = "_".join(r.reagent_name for r in selected_reagents)
+            
+            return True, {
+                'mol': product_mol,
+                'name': product_name,
+                'rxn_id': chosen_rxn,
+                'choice_list': local_sel.copy(),
+                'selected_reagents': selected_reagents
+            }
+            
+        except Exception as e:
+            return False, {
+                'error_type': 'reaction_failed',
+                'error_msg': f'Reaction or sanitization failed: {e}'
+            }
+
+
+    # Enhanced search method with better exhaustion tracking
     def search(
-        self,
-        ts_num_iterations: int = 25,
-        batch_size: int = 128
-    ) -> List[List]:
-        """
-        Run Thompson Sampling for ts_num_iterations rounds, each round generating batch_size new molecules,
-        immediately writing each batch's results to CSV (columns: score, smiles, name), and returning a list
-        of all [score, smiles, name].
-        """
-        out_list: List[List] = []
-        rng = np.random.default_rng()
+            self,
+            ts_num_iterations: int = 25,
+            batch_size: int = 128,
+            min_enumeration_attempts: int = 1000
+        ) -> List[List]:
+            """
+            Run Thompson Sampling with proper reagent exhaustion handling.
+            """
+            out_list: List[List] = []
+            rng = np.random.default_rng()
 
-        # Open CSV and write header if not exists
-        import os, csv
-        write_header = not os.path.exists(self.output_csv)
-        csv_file = open(self.output_csv, "a", newline="")
-        csv_writer = csv.writer(csv_file)
-        if write_header:
-            csv_writer.writerow(["batch", "score", "smiles", "name"])
+            # Open CSV and write header if not exists
+            import os, csv
+            write_header = not os.path.exists(self.output_csv)
+            csv_file = open(self.output_csv, "a", newline="")
+            csv_writer = csv.writer(csv_file)
+            if write_header:
+                csv_writer.writerow(["batch", "score", "smiles", "name"])
 
-        for cycle in tqdm(range(ts_num_iterations), desc="Thompson rounds", disable=self.hide_progress):
-            batch_molecules = []
-            batch_names = []
-            batch_metadata = []  # Store (rxn_id, choice_list, selected_reagents) for tracking
+            for cycle in tqdm(range(ts_num_iterations), desc="Thompson rounds", disable=self.hide_progress):
+                batch_molecules = []
+                batch_names = []
+                batch_metadata = []
+                
+                # Error tracking for this batch
+                error_counts = {}
+                
+                # Generate molecules for this batch
+                molecules_in_batch = 0
+                attempts = 0
+                max_total_attempts = max(min_enumeration_attempts, batch_size * 5)
 
-            # 1) Generate batch_size new molecules using Thompson Sampling with retry logic
-            molecules_in_batch = 0
-            attempts = 0
-            max_total_attempts = batch_size * 5  # Reasonable limit to avoid infinite loops
-
-            while molecules_in_batch < batch_size and attempts < max_total_attempts:
-                attempts += 1
-                
-                # Step 1a: Choose reaction based on Thompson Sampling across all initialized reagents
-                reaction_candidates = []
-                
-                for rxn_id in self.rxn_ids:
-                    per_slot_lists = self._reagents_by_rxn[rxn_id]
+                while molecules_in_batch < batch_size and attempts < max_total_attempts:
+                    attempts += 1
                     
-                    # Sample from all reagents in this reaction to get a "reaction score"
-                    reaction_samples = []
-                    for slot_reagents in per_slot_lists:
-                        slot_samples = []
-                        for reagent in slot_reagents:
-                            if hasattr(reagent, 'current_mean') and hasattr(reagent, 'current_std'):
-                                sample = rng.normal(reagent.current_mean, reagent.current_std)
-                                slot_samples.append(sample)
-                        
-                        if slot_samples:
-                            # Take best sample from this slot as representative
-                            best_slot_sample = max(slot_samples) if self._mode.startswith("maximize") else min(slot_samples)
-                            reaction_samples.append(best_slot_sample)
-                    
-                    if reaction_samples:
-                        # Reaction score is sum/mean of best slot samples
-                        reaction_score = np.mean(reaction_samples)
-                        reaction_candidates.append((reaction_score, rxn_id))
-                
-                if not reaction_candidates:
-                    # Fallback: random reaction selection if no reagents initialized
-                    chosen_rxn = random.choice(self.rxn_ids)
-                else:
-                    # Choose reaction based on its aggregated Thompson sample
-                    if self._mode.startswith("maximize"):
-                        _, chosen_rxn = max(reaction_candidates, key=lambda x: x[0])
-                    else:
-                        _, chosen_rxn = min(reaction_candidates, key=lambda x: x[0])
-
-                # Step 1b: Within chosen reaction, select reagents using Thompson Sampling
-                per_slot_lists = self._reagents_by_rxn[chosen_rxn]
-                tracker = self._trackers_by_rxn[chosen_rxn]
-                n_slots = len(per_slot_lists)
-                
-                # Initialize selection array
-                local_sel = [DisallowTracker.Empty] * n_slots
-                
-                # Fill slots in random order (preserving original TS logic)
-                fill_order = list(range(n_slots))
-                random.shuffle(fill_order)
-                
-                valid_combination = True
-                for slot_i in fill_order:
-                    # Set current slot to To_Fill
-                    local_sel[slot_i] = DisallowTracker.To_Fill
-                    disallow_mask = tracker.get_disallowed_selection_mask(local_sel)
-                    
-                    slot_reagents = per_slot_lists[slot_i]
-                    
-                    # Get current beliefs for reagents in this slot
-                    mus = np.array([
-                        r.current_mean if hasattr(r, 'current_mean') else 0.0 
-                        for r in slot_reagents
-                    ])
-                    sigs = np.array([
-                        r.current_std if hasattr(r, 'current_std') else 1.0 
-                        for r in slot_reagents
-                    ])
-                    
-                    # Thompson sampling: sample from beliefs
-                    choice_samples = rng.normal(size=len(slot_reagents)) * sigs + mus
-                    
-                    # Mask out disallowed reagents
-                    if disallow_mask:
-                        choice_samples[np.array(list(disallow_mask))] = np.nan
-                    
-                    # Check if any valid options remain
-                    if np.all(np.isnan(choice_samples)):
-                        valid_combination = False
-                        break
-                    
-                    # Select reagent using pick_function (argmax/argmin or Boltzmann)
-                    chosen_idx = int(self.pick_function(choice_samples))
-                    local_sel[slot_i] = chosen_idx
-                
-                if not valid_combination:
-                    # Skip this attempt and try again
-                    continue
-                    
-                # Step 1c: Update DisallowTracker and generate molecule
-                tracker.update(local_sel)
-                
-                # Generate the molecule
-                selected_reagents = [per_slot_lists[slot_i][local_sel[slot_i]] for slot_i in range(n_slots)]
-                rxn = self._rxn_by_id[chosen_rxn]
-                products = rxn.RunReactants([r.mol for r in selected_reagents])
-                
-                if products:
-                    try:
-                        product_mol = products[0][0]
-                        Chem.SanitizeMol(product_mol)
-                        product_name = "_".join(r.reagent_name for r in selected_reagents)
-                        
-                        batch_molecules.append(product_mol)
-                        batch_names.append(product_name)
-                        batch_metadata.append((chosen_rxn, local_sel.copy(), selected_reagents))
-                        molecules_in_batch += 1  # Successfully generated a molecule
-                    except:
-                        # Reaction failed - still count as an attempt but don't add to batch
-                        out_list.append([np.nan, "FAIL", ""])
-                        csv_writer.writerow([cycle + 1, np.nan, "FAIL", ""])
-                else:
-                    # No products - still count as an attempt but don't add to batch
-                    out_list.append([np.nan, "FAIL", ""])
-                    csv_writer.writerow([cycle + 1, np.nan, "FAIL", ""])
-
-            # Log if we couldn't fill the entire batch
-            if molecules_in_batch < batch_size:
-                self.logger.warning(f"Batch {cycle+1}: Only generated {molecules_in_batch}/{batch_size} molecules after {attempts} attempts")
-
-            # 2) Batch-evaluate generated molecules
-            if batch_molecules:
-                if hasattr(self.evaluator, 'evaluate_batch'):
-                    scores = self.evaluator.evaluate_batch(batch_molecules)
-                else:
-                    scores = [self.evaluator.evaluate(mol) for mol in batch_molecules]
-                
-                # 3) Process results and update reagent beliefs
-                for mol, name, score, (rxn_id, choice_list, selected_reagents) in zip(
-                    batch_molecules, batch_names, scores, batch_metadata
-                ):
-                    smiles = Chem.MolToSmiles(mol)
-                    score_float = float(score)
-                    
-                    # Store result
-                    out_list.append([score_float, smiles, name])
-                    csv_writer.writerow([cycle + 1, score_float, smiles, name])
-                    
-                    # CRITICAL: Update reagent beliefs if score is finite
-                    if np.isfinite(score_float):
-                        for reagent in selected_reagents:
-                            reagent.add_score(score_float)
-
-            # 4) Log progress every 100 batches
-            if (cycle + 1) % 100 == 0 and out_list:
-                finite_results = [x for x in out_list if np.isfinite(x[0])]
-                if finite_results:
-                    top_score, top_smi, top_name = self._top_func(finite_results, key=lambda x: x[0])
-                    self.logger.info(
-                        f"After {cycle+1} batches ({(cycle+1)*batch_size:,} samples), "
-                        f"top_score={top_score:.3f}, smiles={top_smi}, name={top_name}"
+                    # Call enumeration with exhaustion checking
+                    success, result_data = self.enumerate_molecule(
+                        rng=rng,
+                        cycle=cycle,
+                        attempt=attempts
                     )
+                    
+                    if success:
+                        mol_data = result_data
+                        batch_molecules.append(mol_data['mol'])
+                        batch_names.append(mol_data['name'])
+                        batch_metadata.append((
+                            mol_data['rxn_id'], 
+                            mol_data['choice_list'], 
+                            mol_data['selected_reagents']
+                        ))
+                        molecules_in_batch += 1
+                            
+                    else:
+                        error_data = result_data
+                        error_type = error_data['error_type']
+                        error_counts[error_type] = error_counts.get(error_type, 0) + 1
+                        
+                        # Write failure to CSV
+                        out_list.append([np.nan, "FAIL", error_data['error_msg']])
+                        csv_writer.writerow([cycle + 1, np.nan, "FAIL", error_data['error_msg']])
 
-        csv_file.close()
-        return out_list
+                # Log batch statistics
+                success_rate = molecules_in_batch / attempts if attempts > 0 else 0
+                self.logger.info(
+                    f"Batch {cycle+1}: Generated {molecules_in_batch}/{batch_size} molecules "
+                    f"in {attempts} attempts (success rate: {success_rate:.1%})"
+                )
+                
+                if error_counts:
+                    error_summary = ", ".join([f"{k}: {v}" for k, v in error_counts.items()])
+                    self.logger.info(f"Batch {cycle+1} errors: {error_summary}")
+                
+                # Log exhaustion statistics every 10 batches
+                if (cycle + 1) % 10 == 0:
+                    total_reagents = 0
+                    exhausted_reagents = 0
+                    
+                    for rxn_id in self.rxn_ids:
+                        per_slot = self._reagents_by_rxn[rxn_id]
+                        tracker = self._trackers_by_rxn[rxn_id]
+                        
+                        for slot_i, slot_reagents in enumerate(per_slot):
+                            for reagent_idx in range(len(slot_reagents)):
+                                total_reagents += 1
+                                if tracker.is_reagent_exhausted(slot_i, reagent_idx):
+                                    exhausted_reagents += 1
+                    
+                    exhaustion_rate = exhausted_reagents / total_reagents if total_reagents > 0 else 0
+                    self.logger.info(f"After batch {cycle+1}: {exhausted_reagents}/{total_reagents} reagents exhausted ({exhaustion_rate:.1%})")
+
+                # Evaluate generated molecules
+                if batch_molecules:
+                    if hasattr(self.evaluator, 'evaluate_batch'):
+                        scores = self.evaluator.evaluate_batch(batch_molecules)
+                    else:
+                        scores = [self.evaluator.evaluate(mol) for mol in batch_molecules]
+                    
+                    for mol, name, score, (rxn_id, choice_list, selected_reagents) in zip(
+                        batch_molecules, batch_names, scores, batch_metadata
+                    ):
+                        smiles = Chem.MolToSmiles(mol)
+                        score_float = float(score)
+                        
+                        out_list.append([score_float, smiles, name])
+                        csv_writer.writerow([cycle + 1, score_float, smiles, name])
+                        
+                        if np.isfinite(score_float):
+                            for reagent in selected_reagents:
+                                reagent.add_score(score_float)
+
+                # Log progress
+                if (cycle + 1) % 100 == 0:
+                    finite_results = [x for x in out_list if np.isfinite(x[0])]
+                    if finite_results:
+                        top_score, top_smi, top_name = self._top_func(finite_results, key=lambda x: x[0])
+                        self.logger.info(
+                            f"After {cycle+1} batches: {len(finite_results)} successful molecules, "
+                            f"top_score={top_score:.3f}"
+                        )
+
+            csv_file.close()
+            
+            # Final summary
+            finite_results = [x for x in out_list if np.isfinite(x[0])]
+            self.logger.info(f"Search completed: {len(finite_results)} successful molecules from {len(out_list)} attempts")
+            
+            return out_list
