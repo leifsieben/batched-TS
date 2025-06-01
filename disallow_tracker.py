@@ -59,28 +59,30 @@ class DisallowTracker:
         self._retire_synthon_mask(retire_mask=retire_mask)
 
     def _retire_synthon_mask(self, retire_mask: list[int]):
-        # get the list of cycles that we need to search for retiring
+        # If there are no Empty slots, we have a fully specified combination:
         if retire_mask.count(self.Empty) == 0:
-            # if n_to_fill is one - then we have a completed mask (all spot filled)
-            # so say that we sampled this synthon by updating the counts
+            # We sampled one complete product → update counters & disallow table
             self._n_sampled += 1
-            # and then update the disallow tracker
             self._update(retire_mask)
         else:
+            # For every position that is still Empty, create a new mask that marks it To_Fill
             for cycle_id in [i for i in range(self.n_cycles) if retire_mask[i] == self.Empty]:
-                # mark which cycle we are going to search for synthons that can be paired with the synthon we are retiring
-                retire_mask[cycle_id] = self.To_Fill
+                # Make a fresh copy so we don’t overwrite retire_mask in one branch
+                next_mask = retire_mask.copy()
+                next_mask[cycle_id] = self.To_Fill
+
+                # Compute which synthons at this cycle are now disallowed
                 ts_locations = np.ones(shape=self._initial_reagent_counts[cycle_id])
-                # update ts_locations
-                disallowed_selections = self.get_disallowed_selection_mask(retire_mask)
-                # added this to catch cases where a reaction fails or a reagent doesn't score - PW
+                disallowed_selections = self.get_disallowed_selection_mask(next_mask)
                 if len(disallowed_selections):
                     ts_locations[np.array(list(disallowed_selections))] = np.nan
-                # anything that is not nan is still in play so we need to denote
-                # that pairing it with the synthon we will retire is not allowed
+
+                # For each allowed synthon index, set it and recurse on a fresh copy
                 for synthon_idx in np.argwhere(~np.isnan(ts_locations)).flatten():
-                    retire_mask[cycle_id] = synthon_idx
-                    self._retire_synthon_mask(retire_mask=retire_mask)
+                    deeper_mask = next_mask.copy()
+                    deeper_mask[cycle_id] = synthon_idx
+                    self._retire_synthon_mask(retire_mask=deeper_mask)
+
 
     def update(self, selected: list[int | None]) -> None:
         """

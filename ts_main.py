@@ -53,90 +53,91 @@ def run_ts(input_dict: dict, hide_progress: bool = False) -> None:
     """
     # 1) Grab whatever was passed in:
     maybe_eval = input_dict["evaluator_class"]
-    # If it's already an Evaluator instance, use it. Otherwise, treat it as a class.
     if isinstance(maybe_eval, Evaluator):
         evaluator = maybe_eval
     else:
-        # assume it's a class you need to instantiate
         EvaluatorCls = maybe_eval
-        evaluator    = EvaluatorCls(input_dict["evaluator_arg"])
+        evaluator = EvaluatorCls(input_dict["evaluator_arg"])
 
-    # 2) Grab reaction SMARTS from your reaction_file TSV
-    df = pd.read_csv(input_dict["reaction_file"], sep="\t")
-    reaction_smarts = df.loc[0, "Reaction"]
-    reaction_id     = df.loc[0, "reaction_id"] 
+    # 2) Read *all* reaction SMARTS from reaction_file, into a map reaction_id -> SMARTS
+    reaction_file = input_dict["reaction_file"]
+    df = pd.read_csv(reaction_file, sep="\t")
+    # Build a dict {reaction_id: SMARTS} for every row of the TSV
+    reaction_smarts_map = dict(zip(df["reaction_id"].tolist(), df["Reaction"].tolist()))
 
     # 3) Pull other params
-    num_ts_iterations  = input_dict["num_ts_iterations"]
-    reagent_file  = input_dict["reagent_file"]
-    num_warmup_trials  = input_dict["num_warmup_trials"]
-    result_filename    = input_dict.get("results_filename")
-    ts_mode            = input_dict["ts_mode"]
-    log_filename       = input_dict.get("log_filename")
+    num_ts_iterations = input_dict["num_ts_iterations"]
+    reagent_file = input_dict["reagent_file"]
+    num_warmup_trials = input_dict["num_warmup_trials"]
+    results_filename = input_dict.get("results_filename")
+    ts_mode = input_dict["ts_mode"]
+    log_filename = input_dict.get("log_filename")
+    batch_size = input_dict.get("batch_size", 1)
 
     # 4) Set up logger & sampler
     logger = get_logger(__name__, filename=log_filename)
-    ts     = ThompsonSampler(mode=ts_mode)
+    ts = ThompsonSampler(mode=ts_mode, log_filename=log_filename, output_csv=results_filename)
+    ts.set_reactions(reaction_smarts_map)
     ts.set_hide_progress(hide_progress)
     ts.set_evaluator(evaluator)
 
-    # 5) Load *all* synthons, filter to just this reaction, then group into slots
-    from collections import defaultdict
-    all_regs = []
-    for fn in reagent_file if isinstance(reagent_file, (list,tuple)) else [reagent_file]:
-        all_regs.extend(create_reagents(fn))
-
-    # keep only those with matching reaction_id
-    regs = [r for r in all_regs if r.reaction_id == reaction_id]
-    if not regs:
-        raise RuntimeError(f"No reagents found for reaction_id={reaction_id}")
-
-    # group by synton_idx into slot-lists
-    groups = defaultdict(list)
-    for r in regs:
-        groups[r.synton_idx].append(r)
-    reagent_lists = [groups[i] for i in sorted(groups)]
-
-    # hand the grouped slots to the sampler
-    ts.reagent_lists   = reagent_lists
-    ts.num_prods       = math.prod(len(x) for x in reagent_lists)
-    ts._disallow_tracker = DisallowTracker([len(x) for x in reagent_lists])
-
-    # rebuild the caches exactly as in read_reagents()
-    ts.all_reagents = [r for slot in reagent_lists for r in slot]
-    ts.reaction_map = build_reaction_map(ts.all_reagents)
-    ts.n_sites      = len(reagent_lists)
-    ts._means       = np.zeros(len(ts.all_reagents), dtype=float)
-    ts._stds        = np.zeros(len(ts.all_reagents), dtype=float)
-    ts._refresh_global_stats()
-
-    ts.set_reaction(reaction_smarts)
+    # 5) Load all reagents
+    ts.read_reagents([reagent_file])
 
     # 6) Warm-up & search
-    ts.warm_up(num_warmup_trials=num_warmup_trials)
-    out_list = ts.search(num_cycles=num_ts_iterations)
+    warmup_results = ts.warm_up(num_warmup_trials=num_warmup_trials, batch_size=batch_size)
+    search_results = ts.search(ts_num_iterations=num_ts_iterations, batch_size=batch_size)
 
     # 7) Logging & save
-    total_evals      = evaluator.counter
+    total_evals = evaluator.counter
     percent_searched = total_evals / ts.get_num_prods() * 100
     logger.info(f"{total_evals} evaluations | {percent_searched:.3f}% of total")
 
-    # write results
-    out_df = pd.DataFrame(out_list, columns=["score", "SMILES", "Name"])
-    if result_filename:
-        out_df.to_csv(result_filename, index=False)
-        logger.info(f"Saved results to: {result_filename}")
+    # 8) Rebuild DataFrame from warmup + search results for printing top hits
+    all_results = []
 
-    # print top hits
-    if not hide_progress:
-        ascending = (ts_mode != "maximize")
-        top10 = (
-            out_df
-            .sort_values("score", ascending=ascending)
-            .drop_duplicates(subset="SMILES")
-            .head(10)
-        )
-        print(top10)
+    # warmup_results format: (smiles, name, score) 
+    if warmup_results:
+        for smiles, name, score in warmup_results:
+            all_results.append([score, smiles, name])  # Reorder to [score, smiles, name]
+
+    # search_results format: [score, smiles, name]
+    if search_results:
+        all_results.extend(search_results)
+
+    # Filter out FAIL entries before creating DataFrame
+    valid_results = []
+    for score, smiles, name in all_results:
+        # Check if score is finite and SMILES is a valid molecule
+        if np.isfinite(score) and is_valid_smiles(smiles):
+            valid_results.append([score, smiles, name])
+
+    def is_valid_smiles(smiles_str):
+        """Check if a SMILES string represents a valid molecule"""
+        if not smiles_str or not isinstance(smiles_str, str):
+            return False
+        try:
+            mol = Chem.MolFromSmiles(smiles_str)
+            return mol is not None
+        except:
+            return False
+
+    if valid_results:
+        out_df = pd.DataFrame(valid_results, columns=["score", "SMILES", "Name"])
+        
+        # 9) Print top hits
+        if not hide_progress:
+            ascending = (ts_mode != "maximize")
+            top10 = (
+                out_df
+                .sort_values("score", ascending=ascending)
+                .drop_duplicates(subset="SMILES")
+                .head(10)
+            )
+            print(top10)
+    else:
+        print("No valid results to display")
+
 
 
 def run_10_cycles():
