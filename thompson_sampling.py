@@ -1,5 +1,6 @@
 import random
 from typing import List, Optional, Tuple
+import time
 
 import functools
 import math
@@ -209,7 +210,7 @@ class ThompsonSampler:
             reagent.init_given_prior(prior_mean, prior_std).
         """
         self.logger.info(f"Starting warm-up: {num_warmup_trials} trials/reagent, batch_size={batch_size}")
-
+        warmup_start = time.time()
         # Keep track of reagents that will need initialization
         reagents_to_initialize: dict[tuple[str, int, int], list[float]] = {}
 
@@ -284,7 +285,7 @@ class ThompsonSampler:
         csv_file = open(self.output_csv, "a", newline="")
         csv_writer = csv.writer(csv_file)
         if write_header:
-            csv_writer.writerow(["batch", "score", "smiles", "name"])
+            csv_writer.writerow(["batch", "score", "SMILES", "name"])
 
 
         # 3) Batch-evaluate all combinations
@@ -388,6 +389,8 @@ class ThompsonSampler:
                 self.logger.warning(f"Failed to initialize reagent {reagent.reagent_name}: {e}")
 
         self.logger.info(f"Warm-up completed. Initialized {initialized_count} reagents.")
+        warmup_time = time.time() - warmup_start
+        self.logger.info(f"Warm-up timing: total={warmup_time:.2f}s")
         return warmup_results
 
     def enumerate_molecule(self, rng: np.random.Generator, cycle: int = 0, attempt: int = 0) -> tuple:
@@ -437,7 +440,7 @@ class ThompsonSampler:
         chosen_rxn, init_slot, init_reagent_idx, chosen_reagent = all_reagents[best_reagent_idx]
 
         # LOG: Track which reagents are being selected
-        if cycle < 5 and attempt < 100:
+        #if cycle < 5 and attempt < 100:
             #self.logger.info(f"Batch {cycle+1}, Attempt {attempt}: Selected reagent {chosen_reagent.reagent_name} "
             #                f"(rxn={chosen_rxn}, slot={init_slot}, idx={init_reagent_idx}) "
             #                f"sample={reagent_samples[best_reagent_idx]:.4f}, active={active_reagents}/{len(all_reagents)}")
@@ -544,14 +547,17 @@ class ThompsonSampler:
             """
             out_list: List[List] = []
             rng = np.random.default_rng()
-
+            search_start = time.time()
+            picking_time = 0.0
+            evaluation_time = 0.0
+            enumeration_time = 0.0
             # Open CSV and write header if not exists
             import os, csv
             write_header = not os.path.exists(self.output_csv)
             csv_file = open(self.output_csv, "a", newline="")
             csv_writer = csv.writer(csv_file)
             if write_header:
-                csv_writer.writerow(["batch", "score", "smiles", "name"])
+                csv_writer.writerow(["batch", "score", "SMILES", "name"])
 
             for cycle in tqdm(range(ts_num_iterations), desc="Thompson rounds", disable=self.hide_progress):
                 batch_molecules = []
@@ -565,17 +571,22 @@ class ThompsonSampler:
                 molecules_in_batch = 0
                 attempts = 0
                 max_total_attempts = max(min_enumeration_attempts, batch_size * 5)
-
+                batch_start = time.time()
+                batch_picking_time = 0.0
+                batch_evaluation_time = 0.0
+                batch_enumeration_time = 0.0
                 while molecules_in_batch < batch_size and attempts < max_total_attempts:
-                    attempts += 1
-                    
+                    attempts += 1   
+
                     # Call enumeration with exhaustion checking
+                    enum_start = time.time()
                     success, result_data = self.enumerate_molecule(
                         rng=rng,
                         cycle=cycle,
                         attempt=attempts
                     )
-                    
+                    enumeration_time += time.time() - enum_start
+                    batch_enumeration_time += time.time() - enum_start
                     if success:
                         mol_data = result_data
                         batch_molecules.append(mol_data['mol'])
@@ -627,6 +638,7 @@ class ThompsonSampler:
 
                 # Evaluate generated molecules
                 if batch_molecules:
+                    eval_start = time.time()
                     if hasattr(self.evaluator, 'evaluate_batch'):
                         scores = self.evaluator.evaluate_batch(batch_molecules)
                     else:
@@ -635,6 +647,7 @@ class ThompsonSampler:
                     for mol, name, score, (rxn_id, choice_list, selected_reagents) in zip(
                         batch_molecules, batch_names, scores, batch_metadata
                     ):
+
                         smiles = Chem.MolToSmiles(mol)
                         score_float = float(score)
                         
@@ -644,7 +657,11 @@ class ThompsonSampler:
                         if np.isfinite(score_float):
                             for reagent in selected_reagents:
                                 reagent.add_score(score_float)
-
+                
+                    eval_time = time.time() - eval_start
+                    evaluation_time += eval_time
+                    batch_evaluation_time += eval_time
+                
                 # Log progress
                 if (cycle + 1) % 100 == 0:
                     finite_results = [x for x in out_list if np.isfinite(x[0])]
@@ -656,9 +673,13 @@ class ThompsonSampler:
                         )
 
             csv_file.close()
+            batch_time = time.time() - batch_start
+            self.logger.info(f"Batch {cycle+1} timing: total={batch_time:.2f}s, enumeration={batch_enumeration_time:.2f}s, evaluation={batch_evaluation_time:.2f}s")
             
             # Final summary
             finite_results = [x for x in out_list if np.isfinite(x[0])]
             self.logger.info(f"Search completed: {len(finite_results)} successful molecules from {len(out_list)} attempts")
+            search_time = time.time() - search_start
+            self.logger.info(f"Search timing summary: total={search_time:.2f}s, enumeration={enumeration_time:.2f}s ({enumeration_time/search_time*100:.1f}%), evaluation={evaluation_time:.2f}s ({evaluation_time/search_time*100:.1f}%)")
             
             return out_list

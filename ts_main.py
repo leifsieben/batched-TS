@@ -14,6 +14,7 @@ from ts_logger import get_logger
 from ts_utils import create_reagents, build_reaction_map
 from disallow_tracker import DisallowTracker
 from rdkit import Chem
+import os 
 
 def read_input(json_filename: str) -> dict:
     """
