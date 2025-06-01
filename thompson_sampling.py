@@ -183,10 +183,7 @@ class ThompsonSampler:
             prod_mol = prod[0][0]
             Chem.SanitizeMol(prod_mol)
             product_smiles = Chem.MolToSmiles(prod_mol)
-            if isinstance(self.evaluator, DBEvaluator):
-                res = float(self.evaluator.evaluate(product_name))
-            else:
-                res = self.evaluator.evaluate(prod_mol)
+            res = self.evaluator.evaluate(prod_mol)
             if np.isfinite(res):
                 # Record the score back on each reagent
                 for r in selected_reagents:
@@ -287,7 +284,8 @@ class ThompsonSampler:
         csv_file = open(self.output_csv, "a", newline="")
         csv_writer = csv.writer(csv_file)
         if write_header:
-            csv_writer.writerow(["score", "smiles", "name"])
+            csv_writer.writerow(["batch", "score", "smiles", "name"])
+
 
         # 3) Batch-evaluate all combinations
         warmup_results: list[tuple[str, str, float]] = []
@@ -321,12 +319,12 @@ class ThompsonSampler:
                         batch_metadata.append((rxn_id, choice_list, selected_reagents))
                     except:
                         # Reaction failed, write failure immediately
-                        warmup_results.append(("FAIL", "", np.nan))
-                        csv_writer.writerow([np.nan, "FAIL", ""])
+                        warmup_results.append([np.nan, "FAIL", ""])
+                        csv_writer.writerow([0, np.nan, "FAIL", ""])
                 else:
                     # No products, write failure immediately
-                    warmup_results.append(("FAIL", "", np.nan))
-                    csv_writer.writerow([np.nan, "FAIL", ""])
+                    warmup_results.append([np.nan, "FAIL", ""])  
+                    csv_writer.writerow([0, np.nan, "FAIL", ""])
             
             # Evaluate valid molecules in batch
             if batch_molecules:
@@ -344,8 +342,8 @@ class ThompsonSampler:
                     score_float = float(score)
                     
                     # Store result
-                    warmup_results.append((smiles, name, score_float))
-                    csv_writer.writerow([score_float, smiles, name])
+                    warmup_results.append([score_float, smiles, name])
+                    csv_writer.writerow([0, score_float, smiles, name])
                     
                     # Track reagents that produced finite scores for later initialization
                     if np.isfinite(score_float):
@@ -358,7 +356,7 @@ class ThompsonSampler:
         csv_file.close()
 
         # 4) Compute global prior statistics
-        valid_scores = [score for _, _, score in warmup_results if np.isfinite(score)]
+        valid_scores = [score for score, _, _ in warmup_results if np.isfinite(score)]
         if not valid_scores:
             raise RuntimeError("No valid scores returned from warm-up.")
         
@@ -393,7 +391,6 @@ class ThompsonSampler:
         return warmup_results
 
 
-
     def search(
         self,
         ts_num_iterations: int = 25,
@@ -413,15 +410,21 @@ class ThompsonSampler:
         csv_file = open(self.output_csv, "a", newline="")
         csv_writer = csv.writer(csv_file)
         if write_header:
-            csv_writer.writerow(["score", "smiles", "name"])
+            csv_writer.writerow(["batch", "score", "smiles", "name"])
 
         for cycle in tqdm(range(ts_num_iterations), desc="Thompson rounds", disable=self.hide_progress):
             batch_molecules = []
             batch_names = []
             batch_metadata = []  # Store (rxn_id, choice_list, selected_reagents) for tracking
 
-            # 1) Generate batch_size new molecules using Thompson Sampling
-            for _ in range(batch_size):
+            # 1) Generate batch_size new molecules using Thompson Sampling with retry logic
+            molecules_in_batch = 0
+            attempts = 0
+            max_total_attempts = batch_size * 5  # Reasonable limit to avoid infinite loops
+
+            while molecules_in_batch < batch_size and attempts < max_total_attempts:
+                attempts += 1
+                
                 # Step 1a: Choose reaction based on Thompson Sampling across all initialized reagents
                 reaction_candidates = []
                 
@@ -504,7 +507,7 @@ class ThompsonSampler:
                     local_sel[slot_i] = chosen_idx
                 
                 if not valid_combination:
-                    # Skip this molecule if no valid combination possible
+                    # Skip this attempt and try again
                     continue
                     
                 # Step 1c: Update DisallowTracker and generate molecule
@@ -524,14 +527,19 @@ class ThompsonSampler:
                         batch_molecules.append(product_mol)
                         batch_names.append(product_name)
                         batch_metadata.append((chosen_rxn, local_sel.copy(), selected_reagents))
+                        molecules_in_batch += 1  # Successfully generated a molecule
                     except:
-                        # Reaction failed
+                        # Reaction failed - still count as an attempt but don't add to batch
                         out_list.append([np.nan, "FAIL", ""])
-                        csv_writer.writerow([np.nan, "FAIL", ""])
+                        csv_writer.writerow([cycle + 1, np.nan, "FAIL", ""])
                 else:
-                    # No products
+                    # No products - still count as an attempt but don't add to batch
                     out_list.append([np.nan, "FAIL", ""])
-                    csv_writer.writerow([np.nan, "FAIL", ""])
+                    csv_writer.writerow([cycle + 1, np.nan, "FAIL", ""])
+
+            # Log if we couldn't fill the entire batch
+            if molecules_in_batch < batch_size:
+                self.logger.warning(f"Batch {cycle+1}: Only generated {molecules_in_batch}/{batch_size} molecules after {attempts} attempts")
 
             # 2) Batch-evaluate generated molecules
             if batch_molecules:
@@ -549,7 +557,7 @@ class ThompsonSampler:
                     
                     # Store result
                     out_list.append([score_float, smiles, name])
-                    csv_writer.writerow([score_float, smiles, name])
+                    csv_writer.writerow([cycle + 1, score_float, smiles, name])
                     
                     # CRITICAL: Update reagent beliefs if score is finite
                     if np.isfinite(score_float):

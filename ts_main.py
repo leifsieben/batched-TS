@@ -13,6 +13,7 @@ from thompson_sampling import ThompsonSampler
 from ts_logger import get_logger
 from ts_utils import create_reagents, build_reaction_map
 from disallow_tracker import DisallowTracker
+from rdkit import Chem
 
 def read_input(json_filename: str) -> dict:
     """
@@ -105,13 +106,6 @@ def run_ts(input_dict: dict, hide_progress: bool = False) -> None:
     if search_results:
         all_results.extend(search_results)
 
-    # Filter out FAIL entries before creating DataFrame
-    valid_results = []
-    for score, smiles, name in all_results:
-        # Check if score is finite and SMILES is a valid molecule
-        if np.isfinite(score) and is_valid_smiles(smiles):
-            valid_results.append([score, smiles, name])
-
     def is_valid_smiles(smiles_str):
         """Check if a SMILES string represents a valid molecule"""
         if not smiles_str or not isinstance(smiles_str, str):
@@ -121,6 +115,13 @@ def run_ts(input_dict: dict, hide_progress: bool = False) -> None:
             return mol is not None
         except:
             return False
+
+    # Filter out FAIL entries before creating DataFrame
+    valid_results = []
+    for score, smiles, name in all_results:
+        # Check if score is finite and SMILES is a valid molecule
+        if isinstance(score, (int, float)) and np.isfinite(score) and is_valid_smiles(smiles):
+            valid_results.append([score, smiles, name])
 
     if valid_results:
         out_df = pd.DataFrame(valid_results, columns=["score", "SMILES", "Name"])
