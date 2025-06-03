@@ -29,6 +29,9 @@ def read_input(json_filename: str) -> dict:
         evaluator_class_name = input_data["evaluator_class_name"]
         class_ = getattr(module, evaluator_class_name)
         evaluator_arg = input_data["evaluator_arg"]
+        evaluator_arg = input_data["evaluator_arg"]
+        if "log_transform" in input_data:
+            evaluator_arg["log_transform"] = input_data["log_transform"]  
         evaluator = class_(evaluator_arg)
         input_data['evaluator_class'] = evaluator
     return input_data

@@ -40,10 +40,11 @@ class MiniMolEvaluator(Evaluator):
           - architecture: "standard" or "residual"
           - aggregate: "mean", "sum", or "max"
           - featurization_batch_size: int
+          - log_transform: bool = False  # NEW: Apply log(1 + score) transformation
         """
         self.checkpoints = config["checkpoints"]
         self.tasks = config.get("task_assignments", None)
-        if self.tasks is not None and len(self.tasks) != len(self.checkpoints):
+        if self.tasks is not None and len(self.tasks) != len(self.tasks):
             raise ValueError(
                 f"task_assignments length ({len(self.tasks)}) "
                 f"must equal number of checkpoints ({len(self.checkpoints)})"
@@ -57,6 +58,9 @@ class MiniMolEvaluator(Evaluator):
             )
         self.featurization_batch_size = config.get("featurization_batch_size", 1024)
         self.num_evaluations = 0
+        
+        # NEW: Log transformation toggle
+        self.log_transform = config.get("log_transform", False)
 
         # in-memory featurizer
         self.featurizer = Minimol(batch_size=self.featurization_batch_size)
@@ -132,6 +136,10 @@ class MiniMolEvaluator(Evaluator):
         out = [float("nan")] * n
         for j, v in zip(valid, agg):
             out[j] = float(v)
+
+        # NEW: Apply log(1 + score) transformation if enabled
+        if self.log_transform:
+            out = [np.log1p(score) if np.isfinite(score) else score for score in out]
 
         self.num_evaluations += n
         return out
