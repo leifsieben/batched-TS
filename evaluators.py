@@ -33,18 +33,15 @@ class Evaluator(ABC):
 class MiniMolEvaluator(Evaluator):
     def __init__(self, config: dict):
         """
-        config keys:
-          - checkpoints: List[str]
-          - task_assignments: Optional[List[int]]  # length == len(checkpoints)
-          - mode: "stl" or "mtl"
-          - architecture: "standard" or "residual"
-          - aggregate: "mean", "sum", or "max"
-          - featurization_batch_size: int
-          - log_transform: bool = False  # NEW: Apply log(1 + score) transformation
+        Optimized for Thompson Sampling:
+        - Model caching (load once, reuse)
+        - GPU utilization
+        - Direct model inference
+        - No feature caching (Thompson Sampling never revisits molecules)
         """
         self.checkpoints = config["checkpoints"]
         self.tasks = config.get("task_assignments", None)
-        if self.tasks is not None and len(self.tasks) != len(self.tasks):
+        if self.tasks is not None and len(self.tasks) != len(self.checkpoints):
             raise ValueError(
                 f"task_assignments length ({len(self.tasks)}) "
                 f"must equal number of checkpoints ({len(self.checkpoints)})"
@@ -57,13 +54,44 @@ class MiniMolEvaluator(Evaluator):
                 f"Unsupported aggregate: {self.aggregate}. Use 'mean', 'sum', or 'max'."
             )
         self.featurization_batch_size = config.get("featurization_batch_size", 1024)
-        self.num_evaluations = 0
-        
-        # NEW: Log transformation toggle
         self.log_transform = config.get("log_transform", False)
+        self.num_evaluations = 0
 
-        # in-memory featurizer
+        # GPU optimization
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"MiniMolEvaluator using device: {self.device}")
+
+        # Model caching - load once, reuse forever
+        self._models_cached = False
+        self._loaded_models = []
+
+        # Featurizer (stays on CPU - MiniMol handles this)
         self.featurizer = Minimol(batch_size=self.featurization_batch_size)
+
+    def _load_models_once(self):
+        """Load all models once and cache them on GPU"""
+        if self._models_cached:
+            return
+            
+        print(f"Loading {len(self.checkpoints)} models to {self.device}...")
+        from minimol_predict import load_model
+        
+        self._loaded_models = []
+        task_list = self.tasks if self.tasks is not None else [None] * len(self.checkpoints)
+        
+        for i, (ckpt, task) in enumerate(zip(self.checkpoints, task_list)):
+            print(f"  Loading model {i+1}/{len(self.checkpoints)}: {os.path.basename(ckpt)}")
+            model = load_model(ckpt, mode=self.mode, device=str(self.device), 
+                             architecture=self.architecture)
+            
+            # Ensure model is in eval mode and on correct device
+            model.eval()
+            model.to(self.device)
+            
+            self._loaded_models.append((model, task))
+        
+        print(f"All models loaded and cached on {self.device}")
+        self._models_cached = True
 
     @property
     def counter(self) -> int:
@@ -74,6 +102,10 @@ class MiniMolEvaluator(Evaluator):
 
     def evaluate_batch(self, mols: list) -> list[float]:
         n = len(mols)
+        
+        # Load models once (only happens on first call)
+        self._load_models_once()
+        
         # SMILES standardization
         raw = [Chem.MolToSmiles(m) for m in mols]
         std = [standardize(s) for s in raw]
@@ -83,8 +115,7 @@ class MiniMolEvaluator(Evaluator):
             return [float("nan")] * n
         smiles_list = [std[i] for i in valid]
 
-        # Featurization (bulk, with fallback)
-        # suppress any tqdm output from Minimol
+        # Featurization (suppress output)
         with open(os.devnull, 'w') as fnull, redirect_stdout(fnull), redirect_stderr(fnull):
             try:
                 feats = self.featurizer(smiles_list)
@@ -101,30 +132,33 @@ class MiniMolEvaluator(Evaluator):
                     self.num_evaluations += n
                     return [float("nan")] * n
 
-        X = torch.stack([f.float() for f in feats])
+        # Convert features to tensor and move to GPU
+        X = torch.stack([f.float() for f in feats]).to(self.device)
 
-        # Predictions per checkpoint + task
+        # Direct model inference (bypassing predict_on_precomputed overhead)
         all_preds = []
-        task_list = self.tasks if self.tasks is not None else [None] * len(self.checkpoints)
-        for ckpt, task in zip(self.checkpoints, task_list):
-            df = predict_on_precomputed(
-                X_feat=X,
-                checkpoints=[ckpt],
-                mode=self.mode,
-                species_indices=None,
-                device=None,
-                include_individual_models=False,
-                architecture=self.architecture,
-                task_of_interest=task,
-            )
-            mean_cols = [c for c in df.columns if c.endswith("_mean")]
-            if not mean_cols:
-                raise RuntimeError(f"No _mean column in prediction for {ckpt}")
-            col = mean_cols[0]
-            all_preds.append(df[col].to_list())
+        
+        for model, task in self._loaded_models:
+            with torch.no_grad():
+                # Direct model call
+                output = model(X)
+                probs = torch.sigmoid(output)
+                
+                # Handle MTL task extraction
+                if self.mode == 'mtl' and task is not None:
+                    if probs.dim() > 1 and task < probs.shape[1]:
+                        probs = probs[:, task]
+                    elif probs.dim() > 1:
+                        # Fallback: take first task if specified task doesn't exist
+                        probs = probs[:, 0]
+                    # else: single output, use as-is
+                
+                # Convert to numpy and flatten
+                pred_values = probs.cpu().numpy().flatten()
+                all_preds.append(pred_values)
 
-        # Aggregate across checkpoints
-        M = np.array(all_preds)  # shape (C, V)
+        # Aggregate across models
+        M = np.array(all_preds)  # shape (num_models, num_valid_samples)
         if self.aggregate == "mean":
             agg = M.mean(axis=0)
         elif self.aggregate == "sum":
@@ -137,12 +171,20 @@ class MiniMolEvaluator(Evaluator):
         for j, v in zip(valid, agg):
             out[j] = float(v)
 
-        # NEW: Apply log(1 + score) transformation if enabled
+        # Apply log transformation if enabled
         if self.log_transform:
             out = [np.log1p(score) if np.isfinite(score) else score for score in out]
 
         self.num_evaluations += n
         return out
+
+    def get_memory_info(self):
+        """Get current GPU memory usage"""
+        if self.device.type == 'cuda':
+            allocated = torch.cuda.memory_allocated(self.device) / 1024**3  # GB
+            reserved = torch.cuda.memory_reserved(self.device) / 1024**3    # GB
+            return f"GPU Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB"
+        return "CPU device - no GPU memory info"
 
 
 

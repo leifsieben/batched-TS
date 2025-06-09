@@ -31,6 +31,9 @@ class ThompsonSampler:
         self._disallow_tracker = None
         self.hide_progress = False
         self.output_csv = output_csv
+        self._exhausted_reagents = set()  # Track (rxn_id, slot_i, reagent_idx) that are exhausted
+        self._removal_count = 0
+        self.timing_stats = {'read_reagents': 0, 'warm_up': 0, 'search_total': 0, 'enumerate': 0, 'evaluate': 0}
         self._mode = mode
         if self._mode == "maximize":
             self.pick_function = np.nanargmax
@@ -115,6 +118,7 @@ class ThompsonSampler:
             mapping reaction_id → a DisallowTracker that tracks disallowed combinations for that reaction.
           - self.num_prods: total possible products across all reactions (sum over rxn of ∏ slot_sizes).
         """
+        start = time.time()
         # 1) Load all Reagent objects from every file:
         all_regs: list[Reagent] = []
         for fname in reagent_file_list:
@@ -153,6 +157,7 @@ class ThompsonSampler:
             total_products += prod_count
 
         self.num_prods = total_products
+        self.timing_stats['read_reagents'] = time.time() - start
         self.logger.info(
             f"{self.num_prods:.2e} possible products across {len(self._reagents_by_rxn)} reactions"
         )
@@ -210,7 +215,7 @@ class ThompsonSampler:
             reagent.init_given_prior(prior_mean, prior_std).
         """
         self.logger.info(f"Starting warm-up: {num_warmup_trials} trials/reagent, batch_size={batch_size}")
-        warmup_start = time.time()
+        start = time.time()
         # Keep track of reagents that will need initialization
         reagents_to_initialize: dict[tuple[str, int, int], list[float]] = {}
 
@@ -388,15 +393,16 @@ class ThompsonSampler:
             except ValueError as e:
                 self.logger.warning(f"Failed to initialize reagent {reagent.reagent_name}: {e}")
 
-        self.logger.info(f"Warm-up completed. Initialized {initialized_count} reagents.")
-        warmup_time = time.time() - warmup_start
-        self.logger.info(f"Warm-up timing: total={warmup_time:.2f}s")
+        self.timing_stats['warm_up'] = time.time() - start
         return warmup_results
+
+
 
     def enumerate_molecule(self, rng: np.random.Generator, cycle: int = 0, attempt: int = 0) -> tuple:
         """
-        Enumerate a single molecule using Thompson Sampling with proper exhaustion checking.
+        Enumerate a single molecule using lazy exhaustion checking - only check when we hit failures
         """
+        if attempt == 0: enum_start = time.time()
         # Precompute flat list if not already done
         if not hasattr(self, '_all_reagents_cache'):
             self._all_reagents_cache = []
@@ -408,25 +414,21 @@ class ThompsonSampler:
         
         all_reagents = self._all_reagents_cache
         
-        # Step 1: Thompson sample from ALL reagents, but exclude exhausted ones
+        # Step 1: Thompson sample from ALL reagents, excluding only known exhausted ones
         reagent_samples = []
         active_reagents = 0
         
         for rxn_id, slot_i, reagent_idx, reagent in all_reagents:
-            # Check if this reagent is exhausted using DisallowTracker
-            tracker = self._trackers_by_rxn[rxn_id]
-            
-            if tracker.is_reagent_exhausted(slot_i, reagent_idx):
-                reagent_samples.append(np.nan)  # Exclude exhausted reagents
-                if cycle < 2 and attempt < 10:  # Debug logging
-                    self.logger.debug(f"Reagent {reagent.reagent_name} (rxn={rxn_id}, slot={slot_i}, idx={reagent_idx}) is exhausted")
+            # Only skip if we already KNOW this reagent is exhausted (no expensive check!)
+            if (rxn_id, slot_i, reagent_idx) in self._exhausted_reagents:
+                reagent_samples.append(np.nan)
             else:
                 active_reagents += 1
                 if hasattr(reagent, 'current_mean') and hasattr(reagent, 'current_std'):
                     sample = rng.normal(reagent.current_mean, reagent.current_std)
                     reagent_samples.append(sample)
                 else:
-                    reagent_samples.append(0.0)  # Default for uninitialized
+                    reagent_samples.append(0.0)
 
         # Check if all reagents are exhausted
         if active_reagents == 0:
@@ -439,22 +441,34 @@ class ThompsonSampler:
         best_reagent_idx = int(self.pick_function(np.array(reagent_samples)))
         chosen_rxn, init_slot, init_reagent_idx, chosen_reagent = all_reagents[best_reagent_idx]
 
-        # LOG: Track which reagents are being selected
-        #if cycle < 5 and attempt < 100:
-            #self.logger.info(f"Batch {cycle+1}, Attempt {attempt}: Selected reagent {chosen_reagent.reagent_name} "
-            #                f"(rxn={chosen_rxn}, slot={init_slot}, idx={init_reagent_idx}) "
-            #                f"sample={reagent_samples[best_reagent_idx]:.4f}, active={active_reagents}/{len(all_reagents)}")
+        # Step 2: Try to complete the molecule using only get_disallowed_selection_mask
+        success, result = self._complete_molecule_selection(chosen_rxn, init_slot, init_reagent_idx, rng)
+        if attempt == 0: self.timing_stats['enumerate'] += time.time() - enum_start
 
-        # Step 2: That reagent defines the reaction - get reaction info
+        if success:
+            return True, result
+        
+        # Step 3: LAZY RETIREMENT - only now check if reagents are exhausted
+        if result.get('error_type') == 'no_valid_partners':
+            self._handle_completion_failure(chosen_rxn, init_slot, init_reagent_idx, result)
+            # Try again with updated exhaustion information (limit recursion)
+            if attempt < 3:
+                return self.enumerate_molecule(rng, cycle, attempt + 1)
+        
+        return False, result
+
+    def _complete_molecule_selection(self, chosen_rxn: str, init_slot: int, init_reagent_idx: int, rng) -> tuple:
+        """Complete molecule selection using only get_disallowed_selection_mask"""
+        
         per_slot_lists = self._reagents_by_rxn[chosen_rxn]
         tracker = self._trackers_by_rxn[chosen_rxn]
         n_slots = len(per_slot_lists)
         
-        # Step 3: Initialize selection with the chosen initial reagent
+        # Initialize selection with the chosen initial reagent
         local_sel = [DisallowTracker.Empty] * n_slots
         local_sel[init_slot] = init_reagent_idx
         
-        # Step 4: Fill remaining slots using Thompson Sampling
+        # Fill remaining slots using Thompson Sampling
         remaining_slots = [i for i in range(n_slots) if i != init_slot]
         random.shuffle(remaining_slots)
         
@@ -464,6 +478,15 @@ class ThompsonSampler:
             disallow_mask = tracker.get_disallowed_selection_mask(local_sel)
             
             slot_reagents = per_slot_lists[slot_i]
+            
+            # Add known exhausted reagents to the disallow mask
+            exhausted_in_slot = set()
+            for reagent_idx in range(len(slot_reagents)):
+                if (chosen_rxn, slot_i, reagent_idx) in self._exhausted_reagents:
+                    exhausted_in_slot.add(reagent_idx)
+            
+            # Combine DisallowTracker mask with known exhausted reagents
+            combined_mask = disallow_mask | exhausted_in_slot
             
             # Get current beliefs for reagents in this slot
             mus = np.array([
@@ -479,15 +502,18 @@ class ThompsonSampler:
             choice_samples = rng.normal(size=len(slot_reagents)) * sigs + mus
             
             # Mask out disallowed reagents
-            if disallow_mask:
-                choice_samples[np.array(list(disallow_mask))] = np.nan
+            if combined_mask:
+                choice_samples[np.array(list(combined_mask))] = np.nan
             
             # Check if any valid options remain
             if np.all(np.isnan(choice_samples)):
                 return False, {
                     'error_type': 'no_valid_partners',
                     'error_msg': f'No valid partners for slot {slot_i} in reaction {chosen_rxn}. '
-                            f'Disallowed: {len(disallow_mask)}/{len(slot_reagents)} reagents'
+                            f'Disallowed: {len(disallow_mask)}/{len(slot_reagents)} reagents, '
+                            f'Known exhausted: {len(exhausted_in_slot)} reagents',
+                    'failed_slot': slot_i,
+                    'partial_selection': local_sel.copy()
                 }
             
             # Select reagent using pick_function
@@ -534,6 +560,40 @@ class ThompsonSampler:
                 'error_msg': f'Reaction or sanitization failed: {e}'
             }
 
+    def _handle_completion_failure(self, rxn_id: str, init_slot: int, init_reagent_idx: int, failure_info: dict):
+        """
+        Reactively check exhaustion for reagents involved in the failure
+        """
+        tracker = self._trackers_by_rxn[rxn_id]
+        reagents_to_check = [(rxn_id, init_slot, init_reagent_idx)]
+        
+        # If we failed at a specific slot, check a few reagents from that slot
+        if 'failed_slot' in failure_info:
+            failed_slot = failure_info['failed_slot']
+            slot_size = len(self._reagents_by_rxn[rxn_id][failed_slot])
+            
+            # Check a small sample of reagents from the failed slot
+            sample_size = min(5, slot_size)  # Check up to 5 reagents
+            if slot_size > 0:
+                sample_indices = np.random.choice(slot_size, sample_size, replace=False)
+                for reagent_idx in sample_indices:
+                    reagents_to_check.append((rxn_id, failed_slot, reagent_idx))
+        
+        # Now check exhaustion for these specific reagents (expensive operation)
+        newly_exhausted = 0
+        for check_rxn, check_slot, check_reagent_idx in reagents_to_check:
+            if (check_rxn, check_slot, check_reagent_idx) not in self._exhausted_reagents:
+                check_tracker = self._trackers_by_rxn[check_rxn]
+                if check_tracker.is_reagent_exhausted(check_slot, check_reagent_idx):
+                    self._exhausted_reagents.add((check_rxn, check_slot, check_reagent_idx))
+                    newly_exhausted += 1
+        
+        if newly_exhausted > 0:
+            self._removal_count += newly_exhausted
+            if self._removal_count % 100 == 0:  # Log every 100 removals
+                self.logger.info(f"Total exhausted reagents identified: {self._removal_count}")
+
+
 
     # Enhanced search method with better exhaustion tracking
     def search(
@@ -550,7 +610,6 @@ class ThompsonSampler:
             search_start = time.time()
             picking_time = 0.0
             evaluation_time = 0.0
-            enumeration_time = 0.0
             # Open CSV and write header if not exists
             import os, csv
             write_header = not os.path.exists(self.output_csv)
@@ -572,21 +631,16 @@ class ThompsonSampler:
                 attempts = 0
                 max_total_attempts = max(min_enumeration_attempts, batch_size * 5)
                 batch_start = time.time()
-                batch_picking_time = 0.0
-                batch_evaluation_time = 0.0
-                batch_enumeration_time = 0.0
+
                 while molecules_in_batch < batch_size and attempts < max_total_attempts:
                     attempts += 1   
 
                     # Call enumeration with exhaustion checking
-                    enum_start = time.time()
                     success, result_data = self.enumerate_molecule(
                         rng=rng,
                         cycle=cycle,
                         attempt=attempts
                     )
-                    enumeration_time += time.time() - enum_start
-                    batch_enumeration_time += time.time() - enum_start
                     if success:
                         mol_data = result_data
                         batch_molecules.append(mol_data['mol'])
@@ -616,23 +670,12 @@ class ThompsonSampler:
                 
                 if error_counts:
                     error_summary = ", ".join([f"{k}: {v}" for k, v in error_counts.items()])
-                    self.logger.info(f"Batch {cycle+1} errors: {error_summary}")
+                    self.logger.info(f"Batch {cycle+1} timing: total={batch_time:.2f}s")
                 
-                # Log exhaustion statistics every 10 batches
+                # Replace the expensive exhaustion statistics with this:
                 if (cycle + 1) % 10 == 0:
-                    total_reagents = 0
-                    exhausted_reagents = 0
-                    
-                    for rxn_id in self.rxn_ids:
-                        per_slot = self._reagents_by_rxn[rxn_id]
-                        tracker = self._trackers_by_rxn[rxn_id]
-                        
-                        for slot_i, slot_reagents in enumerate(per_slot):
-                            for reagent_idx in range(len(slot_reagents)):
-                                total_reagents += 1
-                                if tracker.is_reagent_exhausted(slot_i, reagent_idx):
-                                    exhausted_reagents += 1
-                    
+                    total_reagents = len(self._all_reagents_cache) if hasattr(self, '_all_reagents_cache') else 0
+                    exhausted_reagents = len(self._exhausted_reagents)
                     exhaustion_rate = exhausted_reagents / total_reagents if total_reagents > 0 else 0
                     self.logger.info(f"After batch {cycle+1}: {exhausted_reagents}/{total_reagents} reagents exhausted ({exhaustion_rate:.1%})")
 
@@ -658,9 +701,7 @@ class ThompsonSampler:
                             for reagent in selected_reagents:
                                 reagent.add_score(score_float)
                 
-                    eval_time = time.time() - eval_start
-                    evaluation_time += eval_time
-                    batch_evaluation_time += eval_time
+                    self.timing_stats['evaluate'] += time.time() - eval_start
                 
                 # Log progress
                 if (cycle + 1) % 100 == 0:
@@ -680,6 +721,8 @@ class ThompsonSampler:
             finite_results = [x for x in out_list if np.isfinite(x[0])]
             self.logger.info(f"Search completed: {len(finite_results)} successful molecules from {len(out_list)} attempts")
             search_time = time.time() - search_start
-            self.logger.info(f"Search timing summary: total={search_time:.2f}s, enumeration={enumeration_time:.2f}s ({enumeration_time/search_time*100:.1f}%), evaluation={evaluation_time:.2f}s ({evaluation_time/search_time*100:.1f}%)")
+            self.timing_stats['search_total'] = search_time
+            self.logger.info(f"Search timing summary: total={search_time:.2f}s, enumerate={self.timing_stats['enumerate']:.2f}s ({self.timing_stats['enumerate']/search_time*100:.1f}%), evaluate={self.timing_stats['evaluate']:.2f}s ({self.timing_stats['evaluate']/search_time*100:.1f}%)")
+            print(f"TIMING BREAKDOWN: {dict(self.timing_stats)}")
             
             return out_list
