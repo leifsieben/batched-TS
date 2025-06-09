@@ -1,99 +1,101 @@
 # Thompson Sampling for Virtual Screening
 
-This repo accompanies our paper ["Thompson Sampling─An Efficient Method for Searching Ultralarge Synthesis on Demand Databases"](https://pubs.acs.org/doi/10.1021/acs.jcim.3c01790).
+Thompson Sampling is an active learning strategy for efficiently searching large, un-enumerated chemical libraries. This implementation uses a reagent-first sampling approach where the algorithm first selects the most promising reagent across all reactions using Thompson Sampling, then completes the molecule by filling remaining reaction slots while avoiding duplicates. This repo is forked from previous work published here ["Thompson Sampling─An Efficient Method for Searching Ultralarge Synthesis on Demand Databases"](https://pubs.acs.org/doi/10.1021/acs.jcim.3c01790).
 
-Thompson Sampling
-is an active learning strategy that balances the tradeoff between exploitation and exploration. The code in this
-repository implements Thompson Sampling as an efficient searching algorithm for screening large, un-enumerated
-libraries such as [Enamine REAL SPACE](https://enamine.net/compound-collections/real-compounds/real-space-navigator).
+## Installation
 
-This implementation of Thompson Sampling can be run on any un-enumerated library comprised of reactions and reagents. To
-run a virtual screen using Thompson Sampling, start by selecting an un-enumerated library to search, and a screening
-objective to maximize or minimize - e.g. 2D similarity, 3D similarity (such as
-Openeye's [ROCS](https://docs.eyesopen.com/applications/rocs/index.html), or docking, and a query molecule (for 2D and
-3D shape similarity) or target protein structure (for docking).
+```bash
+conda create -c conda-forge -n thompson-sampling rdkit
+conda activate thompson-sampling
+pip install -r requirements.txt
+```
 
-The algorithm begins by constructing prior distributions for the expected value of each reagent in the library. We model
-the distribution of scores produced by any reagent in the library as a normal distribution, for which we are trying to
-estimate the expected value (mean), assuming the standard deviation of the distribution is known. We call this the
-"warmup" period, and start by randomly sampling (making and scoring a molecule with that reagent) each reagent _n_
-times. The prior distribution is then constructed by taking the mean and standard deviation of the scores from the _n_
-random samples.
+## Usage 
 
-Next we repeat the following _n_ times:
+```python 
+python ts_main.py config.json
+```
 
-- Probabilistically select reagents by taking a random pull from the prior distribution of each reagent in the reaction.
-- Select a single reagent for each component of the reaction by taking the maximum of the random pulls from all
-  reagents of that component.
-- Make the molecule (in-silico) and perform conformational analysis (if required for the scoring function)
-- Score the molecule and calculate the bayesian update to the prior distribution
+## Configuration Parameters
 
-The scores and SMILES string for each molecule made and scored are saved and (optionally) written to a file.
+### Required Parameters
 
-**run_ts.py** - The main file for running Thompson Sampling via command line.
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `evaluator_class_name` | string | Name of evaluator class: "MiniMolEvaluator", "FPEvaluator", "MWEvaluator" |
+| `evaluator_arg` | dict | Arguments passed to evaluator constructor (see Evaluator Parameters below) |
+| `reaction_file` | string | Path to TSV file with columns: reaction_id, Reaction |
+| `reagent_file` | string | Path to TSV file with columns: SMILES, synton_id, synton#, reaction_id, release |
+| `num_ts_iterations` | int | Number of Thompson Sampling iterations (typically 100-2000) |
+| `num_warmup_trials` | int | Random samples per reagent during warmup (3 for 2-component, 10+ for 3+ components) |
+| `ts_mode` | string | Optimization direction: "maximize" or "minimize" |
 
-**reagent.py** - Contains the Reagent class which constructs and updates the prior distribution.
+### Optional Parameters
 
-**baseline.py** - Generates brute force or random comparisons.
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `results_filename` | string | null | Output CSV file path for results |
+| `log_filename` | string | null | Log file path (stdout if null) |
+| `batch_size` | int | 128 | Molecules per evaluation batch |
+| `min_enumeration_attempts` | int | 1000 | Minimum enumeration attempts per batch |
 
-**evaluators.py** - Contains the evaluation functions.
+## Evaluator Parameters
 
-**disallow_tracker.py** - Contains the class for keeping track of sampled products.
+### MiniMolEvaluator
 
-**thompson_sampling.py** - Contains the ThompsonSampling class that runs Thompson Sampling
+High-performance ML evaluator with GPU acceleration and model caching.
 
-### Setting up the environment for running Thompson Sampling
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `checkpoints` | list[string] | required | Paths to model checkpoint files |
+| `task_assignments` | list[int] | null | Task index each model should predict (MTL only) |
+| `mode` | string | "stl" | Model type: "stl" (single-task) or "mtl" (multi-task) |
+| `architecture` | string | "standard" | Model architecture: "standard" or "residual" |
+| `aggregate` | string | "mean" | Ensemble aggregation: "mean", "sum", or "max" |
+| `featurization_batch_size` | int | 1024 | Batch size for molecular featurization |
+| `log_transform` | bool | false | Apply log(1 + score) transformation to scores |
 
-Create a new conda environment and install rdkit:
-`conda create -c conda-forge -n <your-env-name> rdkit`
+### FPEvaluator
 
-Activate your environment and install the rest of the requirements:
-`conda activate <your-env-name>`
-`pip install -r requirements.txt`
+2D fingerprint similarity using Morgan fingerprints.
 
-Optionally: install Openeye [toolkits](https://docs.eyesopen.com/toolkits/python/quickstart-python/install.html) to use
-ROCS scoring function.
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `query_smiles` | string | SMILES string of query molecule |
 
-Construct a json file with the desired parameters for your run, see example json files in the `examples` directory. See
-required and optional parameter explanations below.
+### MWEvaluator
 
-### How to run Thompson Sampling
+Molecular weight calculator (no parameters required).
 
-`python ts_main.py <path-to-json-params-file>.json`
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| (none) | - | No parameters required |
 
-Or try one of the example queries:
+## Example Configuration 
 
-`python ts_main.py examples/amide_fp_sim.json`
-
-or
-
-`python ts_main.py examples/quinazoline_fp_sim.json`
-
-
-### Parameters
-
-Required params:
-- `evaluator_arg`: The argument to be passed to the instantiation of the evaluator (e.g. smiles string of the query
-molecule, filepath to the mol file, etc.) See the relevant `Evaluator` for more info.
-- `evaluator_class_name`: Required. The scoring function to use. Must be one of: "FPEvaluator" for 2D similarity, "
-MWEvaluator"for molecular weight, or "ROCSEvaluator". To use your own scoring function, implement a subclass of the
-Evaluator baseclass in evaluators.py.
-- `reaction_smarts`: Required. The SMARTS string for the reaction.
-- `num_ts_iterations`: Required. Number of iterations of Thompson Sampling to run (usually 100 - 2000).
-- `reagent_file_list`: Required. List of filepaths - one for each component of the reaction. Each file should contain the
-smiles strings of valid reagents for that component.
-- `num_warmup_trials`: Required. Number of times to randomly sample each reagent in the reaction. 3 is usually sufficient
-for 2 component reactions, 10 is recommended for reactions with 3 or more components.
-- `ts_mode`: Required. Whether to maximize or minimize the scoring function. Should be one of `maximize` or `minimize`.
-
-Optional params:
-- `results_filename`: Optional. Name of the file to output results to. If None, results will not be saved to a file.
-- `known_std`: Optional. The standard deviation of the distribution for which we are trying to estimate the mean. This
-should be scaled to the scoring function. For 2D similarity (for which scores can range from 0-1, we suggest using 1;
-for ROCS, which ranges from 0-2, we suggest using 2, etc). If not provided, will be set to 1.0.
-- `minimum_uncertainty`: Optional. Uncertainty about the expected value of the prior. If uncertainty is at or near 0 (
-indicating 100% confidence in the expected value) it will be impossible to update the scoring function. Therefore, we
-set a minimum uncertainty > 0 so that the prior can be updated. Increasing this number will lead to more exploration,
-decreasing it will lead to more exploitation. We recommend starting with ~10% of the range of the scoring function. If
-not set, a default of 0.1 is used.
-- `log_filename`: Optional. Log filename to save logs to. If not set, logging will be printed to stdout.
+```python 
+{
+  "evaluator_class_name": "MiniMolEvaluator",
+  "evaluator_arg": {
+    "checkpoints": [
+      "models/bioactivity_model1.ckpt",
+      "models/bioactivity_model2.ckpt",
+      "models/bioactivity_model3.ckpt"
+    ],
+    "mode": "mtl",
+    "task_assignments": [0, 0, 1],
+    "architecture": "standard",
+    "aggregate": "mean",
+    "featurization_batch_size": 4096,
+    "log_transform": false
+  },
+  "reaction_file": "data/reactions.tsv",
+  "reagent_file": "data/reagents.tsv",
+  "num_ts_iterations": 1000,
+  "num_warmup_trials": 3,
+  "ts_mode": "maximize",
+  "batch_size": 10000,
+  "results_filename": "bioactivity_results.csv",
+  "log_filename": "bioactivity_search.log"
+}
+```
